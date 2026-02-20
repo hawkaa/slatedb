@@ -1,4 +1,5 @@
 use crate::bytes_range::BytesRange;
+use crate::cached_object_store::CachedObjectStore;
 use crate::clock::MonotonicClock;
 use crate::config::{CheckpointOptions, DbReaderOptions, ReadOptions, ScanOptions};
 use crate::db_read::DbRead;
@@ -10,6 +11,7 @@ use crate::manifest::store::{ManifestStore, StoredManifest};
 use crate::manifest::Manifest;
 use crate::mem_table::{ImmutableMemtable, KVTable};
 use crate::oracle::DbReaderOracle;
+use crate::paths::PathResolver;
 use crate::rand::DbRand;
 use crate::reader::{DbStateReader, Reader};
 use crate::sst_iter::SstIteratorOptions;
@@ -41,11 +43,11 @@ pub(crate) const DB_READER_TASK_NAME: &str = "manifest_poller";
 /// Read-only interface for accessing a database from either
 /// the latest persistent state or from an arbitrary checkpoint.
 pub struct DbReader {
-    inner: Arc<DbReaderInner>,
+    pub(crate) inner: Arc<DbReaderInner>,
     task_executor: MessageHandlerExecutor,
 }
 
-struct DbReaderInner {
+pub(crate) struct DbReaderInner {
     manifest_store: Arc<ManifestStore>,
     table_store: Arc<TableStore>,
     options: DbReaderOptions,
@@ -155,6 +157,33 @@ impl DbReaderInner {
             closed_result_watcher,
             rand,
         })
+    }
+
+    pub(crate) async fn preload_cache(
+        &self,
+        cached_obj_store: &CachedObjectStore,
+        path: &Path,
+    ) -> Result<(), SlateDBError> {
+        let current_state = Arc::clone(&self.state.read());
+        let core = &current_state.manifest.core;
+        let path_resolver = PathResolver::new(path.clone());
+        let max_cache_size = self
+            .options
+            .object_store_cache_options
+            .max_cache_size_bytes
+            .unwrap_or(usize::MAX);
+        let preload_level = self
+            .options
+            .object_store_cache_options
+            .preload_disk_cache_on_startup;
+        crate::db::preload_cache_from_manifest(
+            core,
+            cached_obj_store,
+            &path_resolver,
+            preload_level,
+            max_cache_size,
+        )
+        .await
     }
 
     async fn get_or_create_checkpoint(
