@@ -11,6 +11,7 @@ use crate::manifest::store::{ManifestStore, StoredManifest};
 use crate::manifest::Manifest;
 use crate::mem_table::{ImmutableMemtable, KVTable};
 use crate::oracle::DbReaderOracle;
+use crate::paths::PathResolver;
 use crate::rand::DbRand;
 use crate::reader::{DbStateReader, Reader};
 use crate::sst_iter::SstIteratorOptions;
@@ -156,6 +157,33 @@ impl DbReaderInner {
             closed_result_watcher,
             rand,
         })
+    }
+
+    async fn preload_cache(
+        &self,
+        cached_obj_store: &CachedObjectStore,
+        path: &Path,
+    ) -> Result<(), SlateDBError> {
+        let current_state = Arc::clone(&self.state.read());
+        let core = &current_state.manifest.core;
+        let path_resolver = PathResolver::new(path.clone());
+        let max_cache_size = self
+            .options
+            .object_store_cache_options
+            .max_cache_size_bytes
+            .unwrap_or(usize::MAX);
+        let preload_level = self
+            .options
+            .object_store_cache_options
+            .preload_disk_cache_on_startup;
+        crate::db::preload_cache_from_manifest(
+            core,
+            cached_obj_store,
+            &path_resolver,
+            preload_level,
+            max_cache_size,
+        )
+        .await
     }
 
     async fn get_or_create_checkpoint(
@@ -558,29 +586,36 @@ impl DbReader {
         let stat_registry = StatRegistry::new();
 
         // Setup object store with optional caching
-        let object_store: Arc<dyn ObjectStore> = match CachedObjectStore::from_config(
+        let maybe_cached = CachedObjectStore::from_config(
             object_store.clone(),
             &options.object_store_cache_options,
             &stat_registry,
             clock.clone(),
             rand.clone(),
         )
-        .await?
-        {
-            Some(cached) => cached,
+        .await?;
+
+        let object_store: Arc<dyn ObjectStore> = match &maybe_cached {
+            Some(cached) => Arc::clone(cached) as Arc<dyn ObjectStore>,
             None => object_store,
         };
 
         let store_provider = DefaultStoreProvider {
-            path,
+            path: path.clone(),
             object_store,
             block_cache: options.block_cache.clone(),
             block_transformer: options.block_transformer.clone(),
         };
 
-        Self::open_internal(&store_provider, checkpoint_id, options, clock, rand)
+        let reader = Self::open_internal(&store_provider, checkpoint_id, options, clock, rand)
             .await
-            .map_err(Into::into)
+            .map_err(crate::Error::from)?;
+
+        if let Some(cached) = &maybe_cached {
+            reader.inner.preload_cache(cached, &path).await?;
+        }
+
+        Ok(reader)
     }
 
     async fn open_internal(

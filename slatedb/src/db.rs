@@ -52,7 +52,7 @@ use crate::config::{
 use crate::db_iter::DbIterator;
 use crate::db_read::DbRead;
 use crate::db_snapshot::DbSnapshot;
-use crate::db_state::{DbState, SsTableId};
+use crate::db_state::{DbState, ManifestCore, SsTableId};
 use crate::db_stats::DbStats;
 use crate::error::SlateDBError;
 use crate::manifest::store::FenceableManifest;
@@ -529,90 +529,24 @@ impl DbInner {
         path_resolver: &PathResolver,
     ) -> Result<(), SlateDBError> {
         let current_state = self.state.read().state();
+        let core = &current_state.manifest.value.core;
         let max_cache_size = self
             .settings
             .object_store_cache_options
             .max_cache_size_bytes
             .unwrap_or(usize::MAX);
-
-        match self
+        let preload_level = self
             .settings
             .object_store_cache_options
-            .preload_disk_cache_on_startup
-        {
-            Some(PreloadLevel::AllSst) => {
-                // Preload both L0 and compacted SSTs
-                let l0_count = current_state.manifest.value.core.l0.len();
-                let compacted_count: usize = current_state
-                    .manifest
-                    .value
-                    .core
-                    .compacted
-                    .iter()
-                    .map(|level| level.ssts.len())
-                    .sum();
-                let total_capacity = l0_count + compacted_count;
-
-                let mut all_sst_paths: Vec<object_store::path::Path> =
-                    Vec::with_capacity(total_capacity);
-
-                // Add L0 SSTs
-                all_sst_paths.extend(
-                    current_state
-                        .manifest
-                        .value
-                        .core
-                        .l0
-                        .iter()
-                        .map(|sst_handle| path_resolver.table_path(&sst_handle.id)),
-                );
-
-                // Add compacted SSTs
-                all_sst_paths.extend(
-                    current_state
-                        .manifest
-                        .value
-                        .core
-                        .compacted
-                        .iter()
-                        .flat_map(|level| &level.ssts)
-                        .map(|sst_handle| path_resolver.table_path(&sst_handle.id)),
-                );
-
-                if !all_sst_paths.is_empty() {
-                    if let Err(e) = cached_obj_store
-                        .load_files_to_cache(all_sst_paths, max_cache_size)
-                        .await
-                    {
-                        warn!("Failed to preload all SSTs to cache: {:?}", e);
-                    }
-                }
-            }
-            Some(PreloadLevel::L0Sst) => {
-                // Preload only L0 SSTs
-                let l0_sst_paths: Vec<object_store::path::Path> = current_state
-                    .manifest
-                    .value
-                    .core
-                    .l0
-                    .iter()
-                    .map(|sst_handle| path_resolver.table_path(&sst_handle.id))
-                    .collect();
-
-                if !l0_sst_paths.is_empty() {
-                    if let Err(e) = cached_obj_store
-                        .load_files_to_cache(l0_sst_paths, max_cache_size)
-                        .await
-                    {
-                        warn!("failed to preload L0 SSTs to cache [error={:?}]", e);
-                    }
-                }
-            }
-            None => {
-                // No preloading
-            }
-        }
-        Ok(())
+            .preload_disk_cache_on_startup;
+        preload_cache_from_manifest(
+            core,
+            cached_obj_store,
+            path_resolver,
+            preload_level,
+            max_cache_size,
+        )
+        .await
     }
 
     /// Returns an error if the database has been closed.
@@ -636,6 +570,54 @@ impl DbInner {
         }
         Ok(())
     }
+}
+
+pub(crate) async fn preload_cache_from_manifest(
+    core: &ManifestCore,
+    cached_obj_store: &CachedObjectStore,
+    path_resolver: &PathResolver,
+    preload_level: Option<PreloadLevel>,
+    max_cache_size: usize,
+) -> Result<(), SlateDBError> {
+    match preload_level {
+        Some(PreloadLevel::AllSst) => {
+            let mut all_sst_paths: Vec<object_store::path::Path> = Vec::with_capacity(
+                core.l0.len() + core.compacted.iter().map(|sr| sr.ssts.len()).sum::<usize>(),
+            );
+            all_sst_paths.extend(core.l0.iter().map(|sst| path_resolver.table_path(&sst.id)));
+            all_sst_paths.extend(
+                core.compacted
+                    .iter()
+                    .flat_map(|sr| &sr.ssts)
+                    .map(|sst| path_resolver.table_path(&sst.id)),
+            );
+            if !all_sst_paths.is_empty() {
+                if let Err(e) = cached_obj_store
+                    .load_files_to_cache(all_sst_paths, max_cache_size)
+                    .await
+                {
+                    warn!("Failed to preload all SSTs to cache: {:?}", e);
+                }
+            }
+        }
+        Some(PreloadLevel::L0Sst) => {
+            let l0_sst_paths: Vec<object_store::path::Path> = core
+                .l0
+                .iter()
+                .map(|sst| path_resolver.table_path(&sst.id))
+                .collect();
+            if !l0_sst_paths.is_empty() {
+                if let Err(e) = cached_obj_store
+                    .load_files_to_cache(l0_sst_paths, max_cache_size)
+                    .await
+                {
+                    warn!("Failed to preload L0 SSTs to cache: {:?}", e);
+                }
+            }
+        }
+        None => {}
+    }
+    Ok(())
 }
 
 #[derive(Clone)]
