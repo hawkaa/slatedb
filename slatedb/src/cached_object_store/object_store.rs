@@ -9,8 +9,11 @@ use futures::{future::BoxFuture, stream, stream::BoxStream, StreamExt};
 use object_store::{path::Path, GetOptions, GetResult, ObjectMeta, ObjectStore};
 use object_store::{Attributes, GetRange, GetResultPayload, PutMultipartOptions, PutResult};
 use object_store::{ListResult, MultipartUpload, PutOptions, PutPayload};
+use parking_lot::Mutex;
 use slatedb_common::clock::SystemClock;
+use std::collections::HashMap;
 use std::{ops::Range, sync::Arc};
+use tokio::sync::OnceCell;
 
 use crate::cached_object_store::admission::AdmissionPicker;
 use crate::cached_object_store::storage::{LocalCacheStorage, PartID};
@@ -19,7 +22,10 @@ use log::warn;
 
 use crate::utils::build_concurrent;
 
-#[derive(Debug, Clone)]
+type InflightPrefetch = Arc<OnceCell<(ObjectMeta, Attributes)>>;
+type InflightPart = Arc<OnceCell<Bytes>>;
+
+#[derive(Clone)]
 pub(crate) struct CachedObjectStore {
     object_store: Arc<dyn ObjectStore>,
     pub(crate) part_size_bytes: usize, // expected to be aligned with mb or kb
@@ -27,6 +33,8 @@ pub(crate) struct CachedObjectStore {
     pub(crate) admission_picker: AdmissionPicker,
     pub(crate) cache_puts: bool,
     stats: Arc<CachedObjectStoreStats>,
+    inflight_prefetches: Arc<Mutex<HashMap<Path, InflightPrefetch>>>,
+    inflight_parts: Arc<Mutex<HashMap<(Path, PartID), InflightPart>>>,
 }
 
 impl CachedObjectStore {
@@ -48,6 +56,8 @@ impl CachedObjectStore {
             stats,
             admission_picker: AdmissionPicker::default(),
             cache_puts,
+            inflight_prefetches: Arc::new(Mutex::new(HashMap::new())),
+            inflight_parts: Arc::new(Mutex::new(HashMap::new())),
         }))
     }
 
@@ -259,6 +269,7 @@ impl CachedObjectStore {
         location: &Path,
         mut opts: GetOptions,
     ) -> object_store::Result<(ObjectMeta, Attributes)> {
+        // Fast path: check cache before entering the coalescer
         let entry = self.cache_storage.entry(location, self.part_size_bytes);
         match entry.read_head().await {
             Ok(Some((meta, attrs))) => return Ok((meta, attrs)),
@@ -273,14 +284,44 @@ impl CachedObjectStore {
             opts.range = Some(self.align_get_range(range));
         }
 
-        let get_result = self.object_store.get_opts(location, opts).await?;
-        let result_meta = get_result.meta.clone();
-        let result_attrs = get_result.attributes.clone();
-        // swallow the error on saving to disk here (the disk might be already full), just fallback
-        // to the object store.
-        // TODO: add a warning log here.
-        self.save_get_result(location, get_result).await.ok();
-        Ok((result_meta, result_attrs))
+        // Coalesce concurrent misses for the same path — only one caller fetches
+        let cell = self
+            .inflight_prefetches
+            .lock()
+            .entry(location.clone())
+            .or_default()
+            .clone();
+
+        let this = self.clone();
+        let location_owned = location.clone();
+        let result = cell
+            .get_or_try_init(|| async {
+                let get_result = this
+                    .object_store
+                    .get_opts(&location_owned, opts)
+                    .await?;
+                let result_meta = get_result.meta.clone();
+                let result_attrs = get_result.attributes.clone();
+                // swallow the error on saving to disk here (the disk might be already full),
+                // just fallback to the object store.
+                this.save_get_result(&location_owned, get_result)
+                    .await
+                    .ok();
+                Ok((result_meta, result_attrs))
+            })
+            .await;
+
+        // Only remove if the cell in the map is still ours (a retry after error
+        // may have inserted a fresh cell that we must not remove).
+        {
+            let mut map = self.inflight_prefetches.lock();
+            if let Some(existing) = map.get(location) {
+                if Arc::ptr_eq(existing, &cell) {
+                    map.remove(location);
+                }
+            }
+        }
+        result.cloned()
     }
 
     /// save the GetResult to the disk cache, a GetResult may be transformed into multiple part
@@ -395,43 +436,71 @@ impl CachedObjectStore {
         range_in_part: Range<usize>,
     ) -> BoxFuture<'static, object_store::Result<Bytes>> {
         let part_size = self.part_size_bytes;
-        let object_store = self.object_store.clone();
         let location = location.clone();
         let entry = self.cache_storage.entry(&location, self.part_size_bytes);
         let db_stats = self.stats.clone();
+        let inflight_parts = self.inflight_parts.clone();
+        let object_store = self.object_store.clone();
+        let cache_storage = self.cache_storage.clone();
         Box::pin(async move {
             db_stats.object_store_cache_part_access.inc();
 
+            // Fast path: check cache before entering the coalescer
             if let Ok(Some(bytes)) = entry.read_part(part_id, range_in_part.clone()).await {
                 db_stats.object_store_cache_part_hits.inc();
                 return Ok(bytes);
             }
 
-            // if the part is not cached, fallback to the object store to get the missing part.
-            // the object stores is expected to return the result whenever the `start` of the range
-            // is not out of the object size.
-            let range = Range {
-                start: (part_id * part_size) as u64,
-                end: ((part_id + 1) * part_size) as u64,
-            };
-            let get_result = object_store
-                .get_opts(
-                    &location,
-                    GetOptions {
-                        range: Some(GetRange::Bounded(range)),
-                        ..Default::default()
-                    },
-                )
-                .await?;
+            // Coalesce concurrent misses for the same (path, part_id).
+            // We coalesce on the full part bytes so different sub-range callers share.
+            let key = (location.clone(), part_id);
+            let cell = inflight_parts.lock().entry(key.clone()).or_default().clone();
 
-            // save it to the disk cache, we'll ignore the error on writing to disk here, just return
-            // the bytes from the object store.
-            let meta = get_result.meta.clone();
-            let attrs = get_result.attributes.clone();
-            let bytes = get_result.bytes().await?;
-            entry.save_head((&meta, &attrs)).await.ok();
-            entry.save_part(part_id, bytes.clone()).await.ok();
-            Ok(Bytes::copy_from_slice(&bytes.slice(range_in_part)))
+            let result = cell
+                .get_or_try_init(|| async {
+                    // if the part is not cached, fallback to the object store to get the
+                    // missing part. the object store is expected to return the result whenever
+                    // the `start` of the range is not out of the object size.
+                    let entry = cache_storage.entry(&location, part_size);
+                    let range = Range {
+                        start: (part_id * part_size) as u64,
+                        end: ((part_id + 1) * part_size) as u64,
+                    };
+                    let get_result = object_store
+                        .get_opts(
+                            &location,
+                            GetOptions {
+                                range: Some(GetRange::Bounded(range)),
+                                ..Default::default()
+                            },
+                        )
+                        .await?;
+
+                    // save it to the disk cache, we'll ignore the error on writing to disk
+                    // here, just return the bytes from the object store.
+                    let meta = get_result.meta.clone();
+                    let attrs = get_result.attributes.clone();
+                    let bytes = get_result.bytes().await?;
+                    entry.save_head((&meta, &attrs)).await.ok();
+                    entry.save_part(part_id, bytes.clone()).await.ok();
+                    Ok::<Bytes, object_store::Error>(bytes)
+                })
+                .await;
+
+            // Only remove if the cell in the map is still ours (a retry after error
+            // may have inserted a fresh cell that we must not remove).
+            {
+                let mut map = inflight_parts.lock();
+                if let Some(existing) = map.get(&key) {
+                    if Arc::ptr_eq(existing, &cell) {
+                        map.remove(&key);
+                    }
+                }
+            }
+            let full_part_bytes = result.cloned()?;
+
+            // Slice to the requested sub-range
+            Ok(full_part_bytes.slice(range_in_part))
         })
     }
 
@@ -512,6 +581,18 @@ impl CachedObjectStore {
             start: start_aligned,
             end: end_aligned,
         }
+    }
+}
+
+impl std::fmt::Debug for CachedObjectStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CachedObjectStore")
+            .field("object_store", &self.object_store)
+            .field("part_size_bytes", &self.part_size_bytes)
+            .field("cache_storage", &self.cache_storage)
+            .field("admission_picker", &self.admission_picker)
+            .field("cache_puts", &self.cache_puts)
+            .finish()
     }
 }
 
@@ -614,7 +695,11 @@ pub(crate) enum InvalidGetRange {
 mod tests {
     use std::sync::Arc;
 
-    use object_store::{path::Path, GetOptions, GetRange, ObjectStore, PutPayload};
+    use futures::stream::BoxStream;
+    use object_store::{
+        path::Path, GetOptions, GetRange, GetResult, ListResult, MultipartUpload, ObjectMeta,
+        ObjectStore, PutMultipartOptions, PutOptions, PutPayload, PutResult,
+    };
     use rand::Rng;
 
     use super::CachedObjectStore;
@@ -1165,5 +1250,170 @@ mod tests {
             let cached_parts = entry.cached_parts().await.unwrap();
             assert_eq!(cached_parts.len(), 0); // No parts should be cached
         }
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_gets_coalesce_remote_fetches() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        // A wrapper that counts get_opts calls to detect duplicate fetches.
+        #[derive(Debug)]
+        struct CountingStore {
+            inner: Arc<dyn ObjectStore>,
+            get_count: AtomicUsize,
+        }
+
+        impl std::fmt::Display for CountingStore {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "CountingStore({})", self.inner)
+            }
+        }
+
+        #[async_trait::async_trait]
+        impl ObjectStore for CountingStore {
+            async fn get_opts(
+                &self,
+                location: &Path,
+                options: GetOptions,
+            ) -> object_store::Result<GetResult> {
+                self.get_count.fetch_add(1, Ordering::SeqCst);
+                // Yield to give other tasks a chance to race
+                tokio::task::yield_now().await;
+                self.inner.get_opts(location, options).await
+            }
+
+            async fn put_opts(
+                &self,
+                location: &Path,
+                payload: PutPayload,
+                opts: PutOptions,
+            ) -> object_store::Result<PutResult> {
+                self.inner.put_opts(location, payload, opts).await
+            }
+
+            async fn put_multipart(
+                &self,
+                location: &Path,
+            ) -> object_store::Result<Box<dyn MultipartUpload>> {
+                self.inner.put_multipart(location).await
+            }
+
+            async fn put_multipart_opts(
+                &self,
+                location: &Path,
+                opts: PutMultipartOptions,
+            ) -> object_store::Result<Box<dyn MultipartUpload>> {
+                self.inner.put_multipart_opts(location, opts).await
+            }
+
+            async fn delete(&self, location: &Path) -> object_store::Result<()> {
+                self.inner.delete(location).await
+            }
+
+            fn list(
+                &self,
+                prefix: Option<&Path>,
+            ) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+                self.inner.list(prefix)
+            }
+
+            fn list_with_offset(
+                &self,
+                prefix: Option<&Path>,
+                offset: &Path,
+            ) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+                self.inner.list_with_offset(prefix, offset)
+            }
+
+            async fn list_with_delimiter(
+                &self,
+                prefix: Option<&Path>,
+            ) -> object_store::Result<ListResult> {
+                self.inner.list_with_delimiter(prefix).await
+            }
+
+            async fn copy(&self, from: &Path, to: &Path) -> object_store::Result<()> {
+                self.inner.copy(from, to).await
+            }
+
+            async fn rename(&self, from: &Path, to: &Path) -> object_store::Result<()> {
+                self.inner.rename(from, to).await
+            }
+
+            async fn copy_if_not_exists(
+                &self,
+                from: &Path,
+                to: &Path,
+            ) -> object_store::Result<()> {
+                self.inner.copy_if_not_exists(from, to).await
+            }
+
+            async fn rename_if_not_exists(
+                &self,
+                from: &Path,
+                to: &Path,
+            ) -> object_store::Result<()> {
+                self.inner.rename_if_not_exists(from, to).await
+            }
+        }
+
+        let inner = Arc::new(object_store::memory::InMemory::new());
+        let test_path = Path::from("test/concurrent.sst");
+        let payload = gen_rand_bytes(2048);
+        inner
+            .put(&test_path, PutPayload::from_bytes(payload.clone()))
+            .await
+            .unwrap();
+
+        let counting_store = Arc::new(CountingStore {
+            inner: inner.clone(),
+            get_count: AtomicUsize::new(0),
+        });
+
+        let test_cache_folder = new_test_cache_folder();
+        let stats_registry = StatRegistry::new();
+        let stats = Arc::new(CachedObjectStoreStats::new(&stats_registry));
+        let cache_storage = Arc::new(FsCacheStorage::new(
+            test_cache_folder,
+            None,
+            None,
+            stats.clone(),
+            Arc::new(DefaultSystemClock::new()),
+            Arc::new(DbRand::default()),
+        ));
+
+        let cached_store =
+            CachedObjectStore::new(counting_store.clone(), cache_storage, 1024, false, stats)
+                .unwrap();
+
+        // Spawn 10 concurrent gets for the same file
+        let barrier = Arc::new(tokio::sync::Barrier::new(10));
+        let mut handles = Vec::new();
+        for _ in 0..10 {
+            let cached_store = cached_store.clone();
+            let test_path = test_path.clone();
+            let barrier = barrier.clone();
+            handles.push(tokio::spawn(async move {
+                barrier.wait().await;
+                let result = cached_store
+                    .cached_get_opts(&test_path, GetOptions::default())
+                    .await
+                    .unwrap();
+                result.bytes().await.unwrap()
+            }));
+        }
+
+        for handle in handles {
+            let bytes = handle.await.unwrap();
+            assert_eq!(bytes, payload);
+        }
+
+        // The prefetch should have been coalesced into a single remote get_opts call.
+        // Without coalescing this would be 10+.
+        let total_gets = counting_store.get_count.load(Ordering::SeqCst);
+        assert!(
+            total_gets <= 2,
+            "expected at most 2 remote get_opts calls (1 prefetch + possibly 1 part miss), got {total_gets}"
+        );
     }
 }
