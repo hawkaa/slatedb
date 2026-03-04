@@ -26,7 +26,7 @@ use crate::{Checkpoint, DbIterator};
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::stream::BoxStream;
-use log::info;
+use log::{info, warn};
 use object_store::path::Path;
 use object_store::ObjectStore;
 use once_cell::sync::Lazy;
@@ -113,16 +113,16 @@ impl DbReaderInner {
                 .await?;
 
         let replay_new_wals = checkpoint_id.is_none() && !options.skip_wal_replay;
-        let initial_state = Arc::new(
-            Self::build_initial_checkpoint_state(
-                Arc::clone(&manifest_store),
-                Arc::clone(&table_store),
-                &options,
-                checkpoint,
-                replay_new_wals,
-            )
-            .await?,
-        );
+        let mut initial_state = Self::build_initial_checkpoint_state(
+            Arc::clone(&manifest_store),
+            Arc::clone(&table_store),
+            &options,
+            checkpoint,
+            replay_new_wals,
+        )
+        .await?;
+        Self::fixup_sst_format_versions(&mut initial_state.manifest, &table_store).await;
+        let initial_state = Arc::new(initial_state);
 
         let mono_clock = Arc::new(MonotonicClock::new(
             system_clock.clone(),
@@ -293,15 +293,65 @@ impl DbReaderInner {
         .await
     }
 
+    /// Reads the actual format version from each SST file's footer and updates
+    /// the in-memory SST handles. This fixes legacy manifest entries that don't
+    /// store format_version and fall back to a default that may be wrong.
+    async fn fixup_sst_format_versions(
+        manifest: &mut Manifest,
+        table_store: &TableStore,
+    ) {
+        for handle in manifest.core.l0.iter_mut() {
+            match table_store.read_sst_version(&handle.id).await {
+                Ok(version) => {
+                    if version != handle.format_version {
+                        info!(
+                            "Corrected SST format version for {:?}: {} -> {}",
+                            handle.id, handle.format_version, version
+                        );
+                        handle.format_version = version;
+                    }
+                }
+                Err(e) => {
+                    warn!(
+                        "Failed to read SST version for {:?}: {:?}, keeping default",
+                        handle.id, e
+                    );
+                }
+            }
+        }
+        for run in manifest.core.compacted.iter_mut() {
+            for handle in run.ssts.iter_mut() {
+                match table_store.read_sst_version(&handle.id).await {
+                    Ok(version) => {
+                        if version != handle.format_version {
+                            info!(
+                                "Corrected SST format version for {:?}: {} -> {}",
+                                handle.id, handle.format_version, version
+                            );
+                            handle.format_version = version;
+                        }
+                    }
+                    Err(e) => {
+                        warn!(
+                            "Failed to read SST version for {:?}: {:?}, keeping default",
+                            handle.id, e
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     async fn rebuild_checkpoint_state(
         &self,
         new_checkpoint: Checkpoint,
     ) -> Result<CheckpointState, SlateDBError> {
         let prior = self.state.read().clone();
-        let manifest = self
+        let mut manifest = self
             .manifest_store
             .read_manifest(new_checkpoint.manifest_id)
             .await?;
+        Self::fixup_sst_format_versions(&mut manifest, &self.table_store).await;
 
         let imm_memtable = prior
             .imm_memtable
