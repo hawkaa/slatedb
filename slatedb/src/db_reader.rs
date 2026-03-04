@@ -293,39 +293,42 @@ impl DbReaderInner {
         .await
     }
 
-    /// For legacy manifest entries that lack an explicit format_version field
-    /// (sentinel value 0), reads the actual version from the SST file footer.
-    /// SSTs with a known version are skipped — no extra I/O on the happy path.
+    /// Reads the actual format version from each SST file's footer and
+    /// corrects any mismatches. This handles two cases:
+    /// 1. Legacy manifest entries with sentinel value 0 (no format_version field)
+    /// 2. Manifest entries corrupted by a bug that wrote the wrong default version
     async fn fixup_sst_format_versions(
         manifest: &mut Manifest,
         table_store: &TableStore,
     ) {
-        use crate::flatbuffer_types::UNKNOWN_SST_FORMAT_VERSION;
-
         let all_handles = manifest
             .core
             .l0
             .iter_mut()
-            .chain(manifest.core.compacted.iter_mut().flat_map(|r| r.ssts.iter_mut()));
+            .chain(
+                manifest
+                    .core
+                    .compacted
+                    .iter_mut()
+                    .flat_map(|r| r.ssts.iter_mut()),
+            );
 
         for handle in all_handles {
-            if handle.format_version != UNKNOWN_SST_FORMAT_VERSION {
-                continue;
-            }
             match table_store.read_sst_version(&handle.id).await {
                 Ok(version) => {
-                    info!(
-                        "Resolved legacy SST format version for {:?}: {}",
-                        handle.id, version
-                    );
-                    handle.format_version = version;
+                    if version != handle.format_version {
+                        info!(
+                            "Corrected SST format version for {:?}: {} -> {}",
+                            handle.id, handle.format_version, version
+                        );
+                        handle.format_version = version;
+                    }
                 }
                 Err(e) => {
                     warn!(
-                        "Failed to read SST version for {:?}: {:?}, defaulting to V1",
+                        "Failed to read SST version for {:?}: {:?}",
                         handle.id, e
                     );
-                    handle.format_version = 1;
                 }
             }
         }
