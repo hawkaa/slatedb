@@ -38,7 +38,7 @@ use crate::flatbuffer_types::root_generated::{
     TieredCompactionSpec, TieredCompactionSpecArgs, Ulid as FbUlid, UlidArgs as FbUlidArgs, Uuid,
     UuidArgs,
 };
-use crate::format::sst::{SST_FORMAT_VERSION, SST_FORMAT_VERSION_V2};
+use crate::format::sst::SST_FORMAT_VERSION;
 use crate::manifest::{ExternalDb, Manifest};
 use crate::partitioned_keyspace::RangePartitionedKeySpace;
 use crate::seq_tracker::SequenceTracker;
@@ -48,19 +48,6 @@ use slatedb_txn_obj::ObjectCodec;
 pub(crate) const MANIFEST_FORMAT_VERSION: u16 = 1;
 pub(crate) const COMPACTIONS_FORMAT_VERSION: u16 = 1;
 pub(crate) const ORIGINAL_SST_FORMAT_VERSION: u16 = SST_FORMAT_VERSION;
-
-/// Returns the SST format version to assume for legacy SSTs that predate
-/// the `format_version` manifest field. Reads `SLATEDB_LEGACY_SST_FORMAT_VERSION`
-/// env var at startup: "1" → V1, "2" → V2. Defaults to V1.
-fn legacy_sst_format_version() -> u16 {
-    static VERSION: std::sync::OnceLock<u16> = std::sync::OnceLock::new();
-    *VERSION.get_or_init(|| {
-        match std::env::var("SLATEDB_LEGACY_SST_FORMAT_VERSION").as_deref() {
-            Ok("2") => SST_FORMAT_VERSION_V2,
-            _ => SST_FORMAT_VERSION,
-        }
-    })
-}
 
 /// FlatBuffer verifier options with increased table limit.
 /// The default limit is 1M tables, but with compression enabled, SST files
@@ -222,7 +209,7 @@ impl FlatBufferManifestCodec {
             let sst_id = Compacted(man_sst.id().ulid());
             let format_version = man_sst
                 .format_version()
-                .unwrap_or(legacy_sst_format_version());
+                .unwrap_or(ORIGINAL_SST_FORMAT_VERSION);
             let sst_info = FlatBufferSsTableInfoCodec::sst_info(&man_sst.info());
             let l0_sst = SsTableHandle::new_compacted(
                 sst_id,
@@ -239,7 +226,7 @@ impl FlatBufferManifestCodec {
                 let id = Compacted(manifest_sst.id().ulid());
                 let format_version = manifest_sst
                     .format_version()
-                    .unwrap_or(legacy_sst_format_version());
+                    .unwrap_or(ORIGINAL_SST_FORMAT_VERSION);
                 let info = FlatBufferSsTableInfoCodec::sst_info(&manifest_sst.info());
                 ssts.push(SsTableHandle::new_compacted(
                     id,
@@ -407,7 +394,7 @@ impl FlatBufferCompactionsCodec {
         let id = Compacted(compacted_sst.id().ulid());
         let format_version = compacted_sst
             .format_version()
-            .unwrap_or(legacy_sst_format_version());
+            .unwrap_or(ORIGINAL_SST_FORMAT_VERSION);
         let info = FlatBufferSsTableInfoCodec::sst_info(&compacted_sst.info());
         let visible_range = compacted_sst
             .visible_range()
