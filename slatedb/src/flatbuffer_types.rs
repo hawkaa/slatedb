@@ -38,7 +38,7 @@ use crate::flatbuffer_types::root_generated::{
     TieredCompactionSpec, TieredCompactionSpecArgs, Ulid as FbUlid, UlidArgs as FbUlidArgs, Uuid,
     UuidArgs,
 };
-use crate::format::sst::{SST_FORMAT_VERSION, SST_FORMAT_VERSION_V2};
+use crate::format::sst::SST_FORMAT_VERSION;
 use crate::manifest::{ExternalDb, Manifest};
 use crate::partitioned_keyspace::RangePartitionedKeySpace;
 use crate::seq_tracker::SequenceTracker;
@@ -47,7 +47,7 @@ use slatedb_txn_obj::ObjectCodec;
 
 pub(crate) const MANIFEST_FORMAT_VERSION: u16 = 1;
 pub(crate) const COMPACTIONS_FORMAT_VERSION: u16 = 1;
-pub(crate) const ORIGINAL_SST_FORMAT_VERSION: u16 = SST_FORMAT_VERSION_V2;
+pub(crate) const ORIGINAL_SST_FORMAT_VERSION: u16 = SST_FORMAT_VERSION;
 
 /// FlatBuffer verifier options with increased table limit.
 /// The default limit is 1M tables, but with compression enabled, SST files
