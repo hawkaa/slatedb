@@ -183,6 +183,11 @@ impl LocalCacheEntry for FsCacheEntry {
             self.part_size,
         );
 
+        // Skip writing if the part already exists on disk.
+        if part_path.exists() {
+            return Ok(());
+        }
+
         self.atomic_write(part_path, buf).await
     }
 
