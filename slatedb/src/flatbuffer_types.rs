@@ -44,12 +44,13 @@ use crate::seq_tracker::SequenceTracker;
 use crate::utils::clamp_allocated_size_bytes;
 use slatedb_txn_obj::ObjectCodec;
 
+use crate::format::sst::SST_FORMAT_VERSION;
+
 pub(crate) const MANIFEST_FORMAT_VERSION: u16 = 1;
 pub(crate) const COMPACTIONS_FORMAT_VERSION: u16 = 1;
-/// Sentinel value for SST entries in the manifest that don't have an explicit
-/// format_version field (legacy manifests). These need to be resolved by reading
-/// the actual version from the SST file footer at startup.
-pub(crate) const UNKNOWN_SST_FORMAT_VERSION: u16 = 0;
+/// Default format version for legacy SST entries in the manifest that lack an
+/// explicit format_version field. V1 is correct since these SSTs predate V2.
+pub(crate) const ORIGINAL_SST_FORMAT_VERSION: u16 = SST_FORMAT_VERSION;
 
 /// FlatBuffer verifier options with increased table limit.
 /// The default limit is 1M tables, but with compression enabled, SST files
@@ -211,7 +212,7 @@ impl FlatBufferManifestCodec {
             let sst_id = Compacted(man_sst.id().ulid());
             let format_version = man_sst
                 .format_version()
-                .unwrap_or(UNKNOWN_SST_FORMAT_VERSION);
+                .unwrap_or(ORIGINAL_SST_FORMAT_VERSION);
             let sst_info = FlatBufferSsTableInfoCodec::sst_info(&man_sst.info());
             let l0_sst = SsTableHandle::new_compacted(
                 sst_id,
@@ -228,7 +229,7 @@ impl FlatBufferManifestCodec {
                 let id = Compacted(manifest_sst.id().ulid());
                 let format_version = manifest_sst
                     .format_version()
-                    .unwrap_or(UNKNOWN_SST_FORMAT_VERSION);
+                    .unwrap_or(ORIGINAL_SST_FORMAT_VERSION);
                 let info = FlatBufferSsTableInfoCodec::sst_info(&manifest_sst.info());
                 ssts.push(SsTableHandle::new_compacted(
                     id,
@@ -396,7 +397,7 @@ impl FlatBufferCompactionsCodec {
         let id = Compacted(compacted_sst.id().ulid());
         let format_version = compacted_sst
             .format_version()
-            .unwrap_or(UNKNOWN_SST_FORMAT_VERSION);
+            .unwrap_or(ORIGINAL_SST_FORMAT_VERSION);
         let info = FlatBufferSsTableInfoCodec::sst_info(&compacted_sst.info());
         let visible_range = compacted_sst
             .visible_range()
@@ -1397,14 +1398,14 @@ mod tests {
         let codec = FlatBufferManifestCodec {};
         let decoded = codec.decode(&bytes).expect("failed to decode manifest");
 
-        // then: format_version should default to UNKNOWN_SST_FORMAT_VERSION
+        // then: format_version should default to ORIGINAL_SST_FORMAT_VERSION
         assert_eq!(
             decoded.core.l0[0].format_version,
-            super::UNKNOWN_SST_FORMAT_VERSION
+            super::ORIGINAL_SST_FORMAT_VERSION
         );
         assert_eq!(
             decoded.core.compacted[0].ssts[0].format_version,
-            super::UNKNOWN_SST_FORMAT_VERSION
+            super::ORIGINAL_SST_FORMAT_VERSION
         );
     }
 
@@ -1535,11 +1536,11 @@ mod tests {
         let codec = FlatBufferCompactionsCodec {};
         let decoded = codec.decode(&bytes).expect("failed to decode compactions");
 
-        // then: format_version should default to UNKNOWN_SST_FORMAT_VERSION
+        // then: format_version should default to ORIGINAL_SST_FORMAT_VERSION
         let decoded_compaction = decoded.get(&compaction_ulid).expect("missing compaction");
         assert_eq!(
             decoded_compaction.output_ssts()[0].format_version,
-            super::UNKNOWN_SST_FORMAT_VERSION
+            super::ORIGINAL_SST_FORMAT_VERSION
         );
     }
 }
