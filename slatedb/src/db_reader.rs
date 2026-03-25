@@ -28,7 +28,7 @@ use crate::{Checkpoint, DbIterator};
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::stream::BoxStream;
-use log::info;
+use log::{info, warn};
 use object_store::path::Path;
 use object_store::ObjectStore;
 use once_cell::sync::Lazy;
@@ -517,17 +517,9 @@ struct ManifestPoller {
     inner: Arc<DbReaderInner>,
 }
 
-#[async_trait]
-impl MessageHandler<DbReaderMessage> for ManifestPoller {
-    fn tickers(&mut self) -> Vec<(Duration, Box<MessageFactory<DbReaderMessage>>)> {
-        vec![(
-            self.inner.options.manifest_poll_interval,
-            Box::new(|| DbReaderMessage::PollManifest),
-        )]
-    }
-
-    async fn handle(&mut self, message: DbReaderMessage) -> Result<(), SlateDBError> {
-        assert!(matches!(message, DbReaderMessage::PollManifest));
+impl ManifestPoller {
+    /// Performs one manifest poll cycle: load manifest, update checkpoint, replay WALs.
+    async fn poll_manifest(&mut self) -> Result<(), SlateDBError> {
         let mut manifest = StoredManifest::load(
             Arc::clone(&self.inner.manifest_store),
             self.inner.system_clock.clone(),
@@ -546,6 +538,32 @@ impl MessageHandler<DbReaderMessage> for ManifestPoller {
         }
 
         self.inner.maybe_refresh_checkpoint(&mut manifest).await
+    }
+}
+
+#[async_trait]
+impl MessageHandler<DbReaderMessage> for ManifestPoller {
+    fn tickers(&mut self) -> Vec<(Duration, Box<MessageFactory<DbReaderMessage>>)> {
+        vec![(
+            self.inner.options.manifest_poll_interval,
+            Box::new(|| DbReaderMessage::PollManifest),
+        )]
+    }
+
+    async fn handle(&mut self, message: DbReaderMessage) -> Result<(), SlateDBError> {
+        assert!(matches!(message, DbReaderMessage::PollManifest));
+        match self.poll_manifest().await {
+            Ok(()) => Ok(()),
+            // Fenced is fatal — another writer has taken over.
+            Err(SlateDBError::Fenced) => Err(SlateDBError::Fenced),
+            // All other errors are treated as transient — log and retry next cycle.
+            // Without this, a single S3 timeout kills the manifest poller permanently,
+            // which deletes the checkpoint on cleanup and bricks the DbReader.
+            Err(e) => {
+                warn!("manifest poll failed, will retry next cycle: {e}");
+                Ok(())
+            }
+        }
     }
 
     async fn cleanup(
@@ -1646,7 +1664,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn should_fail_new_reads_if_manifest_poller_crashes() {
+    async fn should_survive_transient_manifest_poll_error() {
         let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let path = Path::from("/tmp/test_kv_store");
         let test_provider = TestProvider::new(path.clone(), Arc::clone(&object_store));
@@ -1661,6 +1679,7 @@ mod tests {
             .await
             .unwrap();
 
+        // Inject a transient error during manifest poll
         fail_parallel::cfg(
             Arc::clone(&test_provider.fp_registry),
             "list-wal-ssts",
@@ -1668,9 +1687,10 @@ mod tests {
         )
         .unwrap();
         tokio::time::sleep(Duration::from_millis(20)).await;
-        let result = reader.get(b"key").await.unwrap_err();
-        dbg!(&result);
-        assert_eq!(result.to_string(), "Unavailable error: io error (oops)");
+
+        // Reader should still work — transient errors don't kill the poller
+        let result = reader.get(b"key").await.unwrap();
+        assert!(result.is_none());
     }
 
     #[tokio::test]
